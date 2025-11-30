@@ -223,7 +223,6 @@ node C:\Users\YourName\bin\88usage
 ## 🙏 致谢
 
 - [88code](https://www.88code.org/) - 提供中转站服务
-- [Packyapi](https://www.packyapi.com/) - 提供中转站服务
 - [Claude Code](https://claude.com/claude-code) - AI 编程助手
 
 ## 📞 联系方式
