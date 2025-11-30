@@ -1,0 +1,396 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const https = require('https');
+const http = require('http');
+const path = require('path');
+const os = require('os');
+
+// ANSI colors
+const colors = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  white: '\x1b[37m'
+};
+
+function colorize(text, color) {
+  return `${colors[color]}${text}${colors.reset}`;
+}
+
+function log(message, color = 'white') {
+  console.log(colorize(message, color));
+}
+
+function logError(message) {
+  console.error(colorize(`❌ ${message}`, 'red'));
+}
+
+function logSuccess(message) {
+  console.log(colorize(`✓ ${message}`, 'green'));
+}
+
+function logInfo(message) {
+  console.log(colorize(`ℹ ${message}`, 'cyan'));
+}
+
+// Read Claude settings
+function getClaudeSettings() {
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+
+  if (!fs.existsSync(settingsPath)) {
+    throw new Error(`Claude settings not found at ${settingsPath}`);
+  }
+
+  const content = fs.readFileSync(settingsPath, 'utf8');
+  const settings = JSON.parse(content);
+
+  if (!settings.env || !settings.env.ANTHROPIC_AUTH_TOKEN) {
+    throw new Error('ANTHROPIC_AUTH_TOKEN not found in settings.json');
+  }
+
+  const baseUrl = settings.env.ANTHROPIC_BASE_URL || 'https://www.88code.org/api';
+  const apiKey = settings.env.ANTHROPIC_AUTH_TOKEN;
+
+  // Determine API type
+  const isPackyApi = baseUrl.includes('packyapi.com');
+  const is88Code = baseUrl.includes('88code.org');
+
+  if (!isPackyApi && !is88Code) {
+    throw new Error(`Unsupported API base URL: ${baseUrl}`);
+  }
+
+  return {
+    apiKey,
+    baseUrl,
+    isPackyApi,
+    is88Code
+  };
+}
+
+// Make HTTP request with retry
+function makeRequest(url, options, body = null, retries = 3, timeout = 20000) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : http;
+
+    const attemptRequest = (attemptsLeft) => {
+      const req = protocol.request(url, options, (res) => {
+        let data = '';
+
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              reject(new Error(`Failed to parse JSON: ${e.message}`));
+            }
+          } else {
+            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+          }
+        });
+      });
+
+      req.on('error', (err) => {
+        if (attemptsLeft > 0) {
+          logInfo(`请求失败，正在重试... (剩余 ${attemptsLeft} 次)`);
+          setTimeout(() => attemptRequest(attemptsLeft - 1), 1000);
+        } else {
+          reject(err);
+        }
+      });
+
+      req.setTimeout(timeout, () => {
+        req.destroy();
+        if (attemptsLeft > 0) {
+          logInfo(`请求超时，正在重试... (剩余 ${attemptsLeft} 次)`);
+          setTimeout(() => attemptRequest(attemptsLeft - 1), 1000);
+        } else {
+          reject(new Error('Request timeout after all retries'));
+        }
+      });
+
+      if (body) {
+        req.write(body);
+      }
+      req.end();
+    };
+
+    attemptRequest(retries);
+  });
+}
+
+// Get usage from 88code API
+async function get88CodeUsage(apiKey) {
+  const url = 'https://www.88code.org/api/usage';
+  const body = '{}';
+
+  const options = {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  };
+
+  const response = await makeRequest(url, options, body);
+
+  if (!response.ok) {
+    throw new Error(response.msg || 'API request failed');
+  }
+
+  return response.data;
+}
+
+// Get usage from Packyapi
+async function getPackyApiUsage(apiKey) {
+  const url = 'https://www.packyapi.com/api/usage/token/';
+
+  const options = {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`
+    }
+  };
+
+  const response = await makeRequest(url, options);
+
+  if (!response.code) {
+    throw new Error(response.message || 'API request failed');
+  }
+
+  return response.data;
+}
+
+// Get subscription info from 88code API
+async function get88CodeSubscription(apiKey) {
+  const url = 'https://www.88code.org/api/subscription';
+  const body = '{}';
+
+  const options = {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  };
+
+  try {
+    const response = await makeRequest(url, options, body);
+    return response.ok ? response.data : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Format bytes
+function formatTokens(tokens) {
+  if (tokens >= 1000000000) {
+    return `${(tokens / 1000000000).toFixed(2)}B`;
+  } else if (tokens >= 1000000) {
+    return `${(tokens / 1000000).toFixed(2)}M`;
+  } else if (tokens >= 1000) {
+    return `${(tokens / 1000).toFixed(2)}K`;
+  }
+  return tokens.toString();
+}
+
+// Display 88code usage
+function display88CodeUsage(data, subscription) {
+  console.log('\n' + colorize('━'.repeat(60), 'cyan'));
+  console.log(colorize('  88code 中转站用量查询', 'bright'));
+  console.log(colorize('━'.repeat(60), 'cyan') + '\n');
+
+  // Calculate usage
+  const creditLimit = data.creditLimit || 0;
+  const currentCredits = data.currentCredits || 0;
+  const usedCredits = creditLimit - currentCredits;
+  const percentageUsed = creditLimit > 0 ? (usedCredits / creditLimit * 100) : 0;
+  const remainingTokens = Math.max(0, currentCredits * 100);
+  const usedTokens = Math.max(0, usedCredits * 100);
+  const totalTokens = data.totalTokens || 0;
+
+  // Determine color based on usage percentage
+  let usageColor = 'green';
+  if (percentageUsed > 80) usageColor = 'red';
+  else if (percentageUsed > 50) usageColor = 'yellow';
+
+  // Display key info
+  console.log(colorize('  密钥信息', 'bright'));
+  console.log('  ' + '─'.repeat(56));
+  console.log(`  密钥名称:   ${colorize(data.name || 'N/A', 'cyan')}`);
+  console.log(`  订阅类型:   ${colorize(data.subscriptionName || 'N/A', 'yellow')}`);
+  console.log(`  总请求数:   ${colorize((data.totalRequests || 0).toLocaleString(), 'white')}`);
+  console.log(`  总消耗:     ${colorize('$' + (data.totalCost || 0).toFixed(2), 'white')}`);
+  console.log();
+
+  // Display usage
+  console.log(colorize('  用量统计', 'bright'));
+  console.log('  ' + '─'.repeat(56));
+  console.log(`  总额度:     ${colorize(creditLimit.toFixed(2) + ' 美元', 'cyan')}`);
+  console.log(`  已使用:     ${colorize(usedCredits.toFixed(2) + ' 美元', usageColor)} (${colorize(percentageUsed.toFixed(1) + '%', usageColor)})`);
+  console.log(`  剩余额度:   ${colorize(currentCredits.toFixed(2) + ' 美元', 'green')}`);
+  console.log(`  总 tokens:  ${colorize(formatTokens(totalTokens), 'white')}`);
+  console.log(`  已用 tokens: ${colorize(formatTokens(usedTokens), usageColor)}`);
+  console.log(`  剩余 tokens: ${colorize(formatTokens(remainingTokens), 'green')}`);
+
+  // Progress bar
+  const barWidth = 40;
+  const filledWidth = Math.round((percentageUsed / 100) * barWidth);
+  const emptyWidth = barWidth - filledWidth;
+  const bar = '█'.repeat(filledWidth) + '░'.repeat(emptyWidth);
+  console.log(`\n  [${colorize(bar, usageColor)}] ${colorize(percentageUsed.toFixed(1) + '%', usageColor)}\n`);
+
+  // Display subscription from subscriptionEntityList
+  const subscriptionList = data.subscriptionEntityList || subscription;
+  if (subscriptionList && Array.isArray(subscriptionList) && subscriptionList.length > 0) {
+    console.log(colorize('  订阅详情', 'bright'));
+    console.log('  ' + '─'.repeat(56));
+
+    subscriptionList.forEach((sub, index) => {
+      if (index > 0) console.log();
+      console.log(`  [${index + 1}] ${colorize(sub.subscriptionName || 'N/A', 'cyan')}`);
+      console.log(`  价格:       ${colorize('¥' + (sub.cost || 0) + '/' + (sub.billingCycle || '月'), 'yellow')}`);
+      console.log(`  状态:       ${colorize(sub.isActive ? '✓ 活跃' : '✗ 未激活', sub.isActive ? 'green' : 'red')}`);
+      console.log(`  开始时间:   ${colorize(sub.startDate || 'N/A', 'white')}`);
+      console.log(`  到期时间:   ${colorize(sub.endDate || 'N/A', 'white')}`);
+      console.log(`  当前额度:   ${colorize('$' + (sub.currentCredits || 0).toFixed(2), 'green')}`);
+      console.log(`  额度上限:   ${colorize('$' + (sub.creditLimit || 0).toFixed(2), 'cyan')}`);
+      if (sub.features) {
+        console.log(`  功能特性:   ${colorize(sub.features.split('\n')[0], 'dim')}`);
+      }
+    });
+    console.log();
+  }
+
+  console.log(colorize('━'.repeat(60), 'cyan') + '\n');
+}
+
+// Display Packyapi usage
+function displayPackyApiUsage(data) {
+  console.log('\n' + colorize('━'.repeat(60), 'cyan'));
+  console.log(colorize('  Packyapi 中转站用量查询', 'bright'));
+  console.log(colorize('━'.repeat(60), 'cyan') + '\n');
+
+  const totalGranted = data.total_granted || 0;
+  const totalUsed = data.total_used || 0;
+  const totalAvailable = data.total_available || 0;
+  const percentageUsed = totalGranted > 0 ? (totalUsed / totalGranted * 100) : 0;
+
+  let usageColor = 'green';
+  if (percentageUsed > 80) usageColor = 'red';
+  else if (percentageUsed > 50) usageColor = 'yellow';
+
+  console.log(colorize('  用量统计', 'bright'));
+  console.log('  ' + '─'.repeat(56));
+  console.log(`  套餐名称:   ${colorize(data.name || 'N/A', 'cyan')}`);
+  console.log(`  总配额:     ${colorize(formatTokens(totalGranted) + ' tokens', 'cyan')}`);
+  console.log(`  已使用:     ${colorize(formatTokens(totalUsed) + ' tokens', usageColor)} (${colorize(percentageUsed.toFixed(1) + '%', usageColor)})`);
+  console.log(`  剩余配额:   ${colorize(formatTokens(totalAvailable - totalUsed) + ' tokens', 'green')}`);
+
+  if (data.expires_at) {
+    const expiryDate = new Date(data.expires_at * 1000);
+    console.log(`  到期时间:   ${colorize(expiryDate.toLocaleString(), 'white')}`);
+  }
+
+  const barWidth = 40;
+  const filledWidth = Math.round((percentageUsed / 100) * barWidth);
+  const emptyWidth = barWidth - filledWidth;
+  const bar = '█'.repeat(filledWidth) + '░'.repeat(emptyWidth);
+  console.log(`\n  [${colorize(bar, usageColor)}] ${colorize(percentageUsed.toFixed(1) + '%', usageColor)}\n`);
+
+  console.log(colorize('━'.repeat(60), 'cyan') + '\n');
+}
+
+// Show help
+function showHelp() {
+  console.log(`
+${colorize('88code 中转站用量查询工具 v1.0', 'bright')}
+
+${colorize('用法:', 'cyan')}
+  check-88code-usage [选项]
+  88usage [选项]
+
+${colorize('选项:', 'cyan')}
+  -h, --help     显示此帮助信息
+  -v, --version  显示版本信息
+  --no-retry     禁用自动重试机制
+
+${colorize('描述:', 'cyan')}
+  从 ~/.claude/settings.json 读取配置并查询 88code/Packyapi 中转站的用量信息
+
+${colorize('配置文件:', 'cyan')}
+  ~/.claude/settings.json
+
+${colorize('支持的中转站:', 'cyan')}
+  - 88code.org
+  - packyapi.com
+
+${colorize('示例:', 'cyan')}
+  88usage              # 查询用量
+  88usage --help       # 显示帮助
+  88usage --no-retry   # 禁用重试
+`);
+}
+
+// Main function
+async function main() {
+  // Parse arguments
+  const args = process.argv.slice(2);
+
+  if (args.includes('-h') || args.includes('--help')) {
+    showHelp();
+    process.exit(0);
+  }
+
+  if (args.includes('-v') || args.includes('--version')) {
+    console.log('v1.0.0');
+    process.exit(0);
+  }
+
+  try {
+    logInfo('正在读取 Claude 配置...');
+    const settings = getClaudeSettings();
+
+    logInfo(`检测到 API 类型: ${settings.is88Code ? '88code' : 'Packyapi'}`);
+    logInfo('正在查询用量信息...\n');
+
+    if (settings.is88Code) {
+      const [usage, subscription] = await Promise.all([
+        get88CodeUsage(settings.apiKey),
+        get88CodeSubscription(settings.apiKey)
+      ]);
+      display88CodeUsage(usage, subscription);
+    } else if (settings.isPackyApi) {
+      const usage = await getPackyApiUsage(settings.apiKey);
+      displayPackyApiUsage(usage);
+    }
+
+    logSuccess('查询完成！');
+    process.exit(0);
+  } catch (error) {
+    logError(`错误: ${error.message}`);
+    if (error.message.includes('timeout')) {
+      console.log('\n' + colorize('💡 提示:', 'yellow'));
+      console.log('  网络连接似乎较慢，请稍后重试');
+      console.log('  如果问题持续，请检查网络连接');
+    }
+    process.exit(1);
+  }
+}
+
+// Run
+main();
