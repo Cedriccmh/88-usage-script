@@ -4,7 +4,7 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D14.0.0-brightgreen.svg)](https://nodejs.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Cedriccmh/88-usage-script)
 
-一个用于查询 88code/Packyapi 中转站 API 用量的命令行工具，支持 Linux、macOS 和 Windows。
+一个用于查询 88code 中转站 API 用量的命令行工具，支持 Linux、macOS 和 Windows。
 
 ## ✨ 功能特性
 
